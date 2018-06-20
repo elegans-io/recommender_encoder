@@ -540,7 +540,7 @@ if __name__ == "__main__":
 
     words_embedding_size = 0
     #items_embedding_size = params['items_embedding_size']
-    n_profile_features = 10
+    n_profile_features = 0 # 10 is the number of feature per user
     relu_dimension = items_embedding_size + int((n_profile_features + words_embedding_size) / 2)
     num_sampled = 8   # number of classes to randomly sample per batch
     if synthetic:
@@ -718,7 +718,8 @@ if __name__ == "__main__":
     num_steps = 100 * 60 * 10
     num_steps = 10000
 
-    with tf.Session(graph=graph, config=tf.ConfigProto(log_device_placement=True)) as session:
+    log_device_placement = False
+    with tf.Session(graph=graph, config=tf.ConfigProto(log_device_placement=log_device_placement)) as session:
         init.run()
         print('Initialized')
         average_loss = 0.0
@@ -753,11 +754,17 @@ if __name__ == "__main__":
                     profile_train_input: batch["profiles"],
                     train_labels: batch["labels"]
                 }
-            else:
+            elif(n_profile_features > 0):
                 feed_dict = {
                     items_train_input: vsp_items_train_input,
                     items_weights_train_input: vsp_items_weights_train_input,
                     profile_train_input: batch["profiles"],
+                    train_labels: batch["labels"]
+                }
+            else:
+                feed_dict = {
+                    items_train_input: vsp_items_train_input,
+                    items_weights_train_input: vsp_items_weights_train_input,
                     train_labels: batch["labels"]
                 }
 
