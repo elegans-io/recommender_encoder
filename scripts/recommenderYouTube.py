@@ -384,7 +384,7 @@ class ConfigParams:
 
     def __init__(self, config_file='config'):
         self.set_default_vals()
-        if not config_file:
+        if config_file:
             fields_strval = self.parse_config(config_file)
 
             for field, strval in fields_strval.items():
