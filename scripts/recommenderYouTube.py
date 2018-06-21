@@ -384,21 +384,21 @@ class ConfigParams:
 
     def __init__(self, config_file='config'):
         self.set_default_vals()
+        if not config_file:
+            fields_strval = self.parse_config(config_file)
 
-        fields_strval = self.parse_config(config_file)
-
-        for field, strval in fields_strval.items():
-            if field == 'batch_size':
-                self.batch_size = int(strval)
-            elif field == 'items_embedding_size':
-                self.items_embedding_size = int(strval)
-            elif field == 'learning_rate':
-                self.learning_rate = float(strval)
+            for field, strval in fields_strval.items():
+                if field == 'batch_size':
+                    self.batch_size = int(strval)
+                elif field == 'items_embedding_size':
+                    self.items_embedding_size = int(strval)
+                elif field == 'learning_rate':
+                    self.learning_rate = float(strval)
 
     def set_default_vals(self):
         self.batch_size = 128
         self.items_embedding_size = 10
-        self.learning_rate = 0.01
+        self.learning_rate = 0.1
 
     def parse_config(self, filename):
 
