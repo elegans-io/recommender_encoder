@@ -36,7 +36,7 @@ def parse_args():
                         help='file with configuration parameters')
     parser.add_argument('-b', '--batch-size', type=int, required=False, dest='batch_size', default=128,
                         help='batch size (default 128)')
-    parser.add_argument('-l', '--learning-rate', type=float, required=False, dest='learning_rate', default=0.001,
+    parser.add_argument('-r', '--learning-rate', type=float, required=False, dest='learning_rate', default=0.001,
                         help='learning rate (default 0.001)')
     parser.add_argument('-i', '--items-embedding-size', type=int, required=False, default=10,
                         dest='items_embedding_size', help='size of the embedding items space (default 10)')
@@ -46,6 +46,8 @@ def parse_args():
                         help='folder containing data for training (default \'\')')
     parser.add_argument('-s', '--synthetic-data', required=False, dest='synthetic', action='store_true',
                         help='boolean whether data are synthetic (default False)')
+    parser.add_argument('-l', '--n-labels', type=int, required=False, dest='n_labels', default=1,
+                        help='number of labels to train with (default 1)')
 
     args = parser.parse_args()
     return args
@@ -247,7 +249,7 @@ def build_obs_dataset_list(observations, roll_over=10,
 
 
 # Fa una lista
-def build_obs_basket_dataset_list(observations, decay_type=None, decay_period=86400 * 365, n_users=0):
+def build_obs_basket_dataset_list(observations, decay_type=None, decay_period=86400 * 365, n_users=0, n_labels=1):
     '''
 
     :par observations: '73462': [('2015-02-12', '305', '11', '234'), ('2015-02-15', '3045', '256', '234', '746', '4523'), ...]
@@ -292,6 +294,7 @@ def build_obs_basket_dataset_list(observations, decay_type=None, decay_period=86
         n_users = len(observations)
 
     for u in list(observations.keys())[:n_users]:
+
         prev_basket_time = 0
         prev_basket = []
         for index, (label_time, basket) in enumerate(observations[u]):
@@ -305,8 +308,9 @@ def build_obs_basket_dataset_list(observations, decay_type=None, decay_period=86
 
             weight = fdecay(int(prev_basket_time), label_time)
             trainers = [(item, weight) for item in prev_basket]
-            for label in basket:
-                result.append((int(u), label, trainers))
+            n_basket_labels = int(len(basket) / n_labels)
+            for i in range(n_basket_labels):
+                result.append((int(u), basket[i*n_labels:(i+1)*n_labels], trainers))
 
             prev_basket_time = label_time
             prev_basket = basket
@@ -404,7 +408,8 @@ def generate_batch_constant(obs_dataset_list, item_titles, data_index, batch_siz
             one_hot_items_values += item_value
             one_hot_items_weights += item_weight
             profiles.append(profile)
-            # labels.append([label])  # each label is in reality a one-hot representation to be embedded
+            # nce with one label
+            #labels.append([label])  # each label is in reality a one-hot representation to be embedded
             labels.append(label)  # each label is in reality a one-hot representation to be embedded
             batch_idx += 1
             idx = (data_index + batch_idx) % len(obs_dataset_list)
@@ -512,7 +517,7 @@ def date_to_integer(dt_time):
 
 
 class ConfigParams:
-    fields_to_search = ['batch_size', 'items_embedding_size', 'learning_rate', 'n_epochs', 'data_folder', 'synthetic']
+    fields_to_search = ['batch_size', 'items_embedding_size', 'learning_rate', 'n_epochs', 'data_folder', 'synthetic', 'n_labels']
 
     def __init__(self, config_file='config'):
         self.set_default_vals()
@@ -532,6 +537,8 @@ class ConfigParams:
                     self.data_folder = strval
                 elif field == 'synthetic':
                     self.synthetic = True
+                elif field == 'n_labels':
+                    self.n_labels = int(strval)
 
     def set_default_vals(self):
         self.batch_size = 128
@@ -540,6 +547,7 @@ class ConfigParams:
         self.n_epochs = 100
         self.data_folder = ''
         self.synthetic = False
+        self.n_labels = 1
 
     def parse_config(self, filename):
 
@@ -570,6 +578,7 @@ if __name__ == "__main__":
         n_epochs = args.n_epochs
         data_folder = args.data_folder
         synthetic = args.synthetic
+        n_labels = args.n_labels
     else:
         params = ConfigParams(args.config_file)
         train_batch_size = params.batch_size
@@ -578,10 +587,10 @@ if __name__ == "__main__":
         n_epochs = params.n_epochs
         data_folder = params.data_folder
         synthetic = params.synthetic
+        n_labels = params.n_labels
 
-
-    print('batch_size: {bs}\nitems embedding size: {ies}\nlearning rate: {lr}\nnumber of epochs: {ne}\ndata folder: {df}\nsynthetic: {s}\n'
-          .format(bs=train_batch_size, ies=items_embedding_size, lr=learning_rate, ne=n_epochs, df=data_folder, s=synthetic))
+    print('batch_size: {bs}\nitems embedding size: {ies}\nlearning rate: {lr}\nnumber of epochs: {ne}\ndata folder: {df}\nsynthetic: {s}\nn_labels: {nl}'
+          .format(bs=train_batch_size, ies=items_embedding_size, lr=learning_rate, ne=n_epochs, df=data_folder, s=synthetic, nl=n_labels))
 
     # synthetic = False
 
@@ -657,7 +666,8 @@ if __name__ == "__main__":
         obs_dataset, max_items = build_obs_basket_dataset_list(observations=obs,
                                                                decay_type=None,
                                                                decay_period=86400 * 365,
-                                                               n_users=0)
+                                                               n_users=0,
+                                                               n_labels=n_labels)
 
     obs_dataset[2]
 
@@ -689,6 +699,8 @@ if __name__ == "__main__":
     valid_size = 10
     valid_window = 1000
     valid_examples = list(range(10))
+    valid_examples.append(385)
+    valid_examples.append(213)
 
     words = set()
 
@@ -728,7 +740,8 @@ if __name__ == "__main__":
         if n_profile_features > 0:
             profile_input = tf.placeholder(tf.float32, shape=[None, n_profile_features], name="profile_input")
 
-        labels = tf.placeholder(tf.int64, shape=None, name="labels")
+        labels = tf.placeholder(tf.int64, shape=[None, n_labels], name="labels")
+        #labels = tf.placeholder(tf.int64, shape=None, name="labels")
         #labels = tf.placeholder(tf.int64, shape=(batch_size, 1))
 
         batch_size = tf.placeholder(tf.int64, name='batch_size')
@@ -771,12 +784,12 @@ if __name__ == "__main__":
         iterator = dataset.make_initializable_iterator()
 
         # items_input, items_weights_train_input, profile_input, train_labels = iter_training_set.get_next()
-        next = iterator.get_next()
-        print(next)
-        # items_input = next['items_input']
-        # items_weights_train_input = next['items_weights_train_input']
-        # profile_input = next['profile_input']
-        # train_labels = next['train_labels']
+        next_batch = iterator.get_next()
+        print(next_batch)
+        # items_input = next_batch['items_input']
+        # items_weights_train_input = next_batch['items_weights_train_input']
+        # profile_input = next_batch['profile_input']
+        # train_labels = next_batch['train_labels']
 
         #if synthetic:
         # test book similarity
@@ -793,16 +806,16 @@ if __name__ == "__main__":
             # Random values to the embedding vectors
             items_embeddings = tf.Variable(tf.random_uniform([max_item_id, items_embedding_size], -1.0, 1.0))
             embedded_items = tf.nn.embedding_lookup_sparse(params=items_embeddings,
-                                                           sp_ids=next['items_input'],
-                                                           sp_weights=next['items_weights_train_input'],
+                                                           sp_ids=next_batch['items_input'],
+                                                           sp_weights=next_batch['items_weights_train_input'],
                                                            combiner='mean')
 
             if words_embedding_size > 0:
                 words_embeddings = tf.Variable(tf.random_uniform([vocabulary_size, words_embedding_size], -1.0, 1.0))
 
                 embedded_words = tf.nn.embedding_lookup_sparse(params=words_embeddings,
-                                                               sp_ids=next['words_input'],
-                                                               sp_weights=next['words_weights_train_input'],
+                                                               sp_ids=next_batch['words_input'],
+                                                               sp_weights=next_batch['words_weights_train_input'],
                                                                combiner='mean')
 
             # adesso ho i vettori delle parole e degli item (mediati nel tempo), piu` i profili (che non vengono embedded).
@@ -812,7 +825,7 @@ if __name__ == "__main__":
                 total_embedded = tf.concat([embedded_items, embedded_words, profile_input], 1)
                 # total_embedded = tf.concat([embedded_items, embedded_words, profile_input], 1)
             elif n_profile_features > 0:
-                total_embedded = tf.concat([embedded_items, next['profile_input']], 1)
+                total_embedded = tf.concat([embedded_items, next_batch['profile_input']], 1)
             elif words_embedding_size > 0:
                 total_embedded = tf.concat([embedded_items, embedded_words], 1)
             else:
@@ -827,11 +840,15 @@ if __name__ == "__main__":
             initializer = tf.contrib.layers.xavier_initializer()
 
             # Go through layer
-            relu_1_weights = tf.Variable(initializer([total_embedded_input_size, max_item_id]))
-            # relu_1_weights = tf.Variable(tf.random_normal([total_embedded_input_size, max_item_id]))
+            # softmax
+            # relu_1_weights = tf.Variable(initializer([total_embedded_input_size, max_item_id]))
+            # nce
+            relu_1_weights = tf.Variable(tf.random_normal([total_embedded_input_size, items_embedding_size]))
 
-            relu_1_bias = tf.Variable(initializer([max_item_id]))
-            # relu_1_bias = tf.Variable(tf.random_normal([max_item_id]))
+            # softmax
+            # relu_1_bias = tf.Variable(initializer([max_item_id]))
+            # nce
+            relu_1_bias = tf.Variable(tf.random_normal([items_embedding_size]))
 
             relu_1_output = tf.nn.relu_layer(total_embedded, relu_1_weights, relu_1_bias, name="relu_1")
 
@@ -851,29 +868,49 @@ if __name__ == "__main__":
             # La probabilita` di avere label dipende dalla distanza dell'item di input, ma anche da quanto label
             # vende... tipo voglio minimizzare (distance(0-1) - absolute_probability) o roba simile.
             # """
-            # nce_weights = tf.Variable(tf.truncated_normal([max_item_id, items_embedding_size],
-            #                                               stddev=1.0 / math.sqrt(items_embedding_size)))
-            # nce_biases = tf.Variable(tf.zeros([max_item_id]))
+            nce_weights = tf.Variable(tf.truncated_normal([max_item_id, items_embedding_size],
+                                                           stddev=1.0 / math.sqrt(items_embedding_size)))
+            nce_biases = tf.Variable(tf.zeros([max_item_id]))
+            
+            loss = tf.reduce_mean(
+                tf.nn.nce_loss(weights=nce_weights,
+                                biases=nce_biases,
+                                labels=next_batch['labels'],
+                                inputs=relu_1_output,
+                                #inputs=embedded_items,
+                                num_sampled=num_sampled,
+                                num_classes=max_item_id,
+                                num_true=n_labels,
+                                remove_accidental_hits=True  # in case takes a label as negative
+                                )
+            )
+
+            # softmax_weights = tf.Variable(tf.truncated_normal([max_item_id, items_embedding_size],
+            #                                                stddev=1.0 / math.sqrt(items_embedding_size)))
+            # softmax_biases = tf.Variable(tf.zeros([max_item_id]))
             #
-            # loss = tf.reduce_mean(
-            #     tf.nn.nce_loss(weights=nce_weights,
-            #                    biases=nce_biases,
-            #                    labels=next['train_labels'],
-            #                    inputs=embedded_items,
-            #                    num_sampled=num_sampled,
-            #                    num_classes=max_item_id,
-            #                    num_true=1,
-            #                    remove_accidental_hits=True  # in case takes a label as negative
-            #                    )
+            # tf.nn.sampled_softmax_loss(
+            #     weights=softmax_weights,
+            #     biases=softmax_biases,
+            #     labels=next_batch['labels'],
+            #     inputs=relu_1_output,
+            #     num_sampled=num_sampled,
+            #     num_classes=max_item_id,
+            #     num_true=1,
+            #     sampled_values=None,
+            #     remove_accidental_hits=True,
+            #     partition_strategy='mod',
+            #     name='sampled_softmax_loss',
+            #     seed=None
             # )
 
-            loss = tf.reduce_mean(
-                tf.nn.sparse_softmax_cross_entropy_with_logits(
-                    labels=next['labels'],
-                    logits=relu_1_output,
-                    name='sparse_softmax_cross_entropy'
-                )
-            )
+            # loss = tf.reduce_mean(
+            #    tf.nn.sparse_softmax_cross_entropy_with_logits(
+            #        labels=next_batch['labels'],
+            #        logits=relu_1_output,
+            #        name='sparse_softmax_cross_entropy'
+            #    )
+            # )
 
         # The optimizer will optimize the softmax_weights AND the embeddings.
         optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(loss)
@@ -973,11 +1010,11 @@ if __name__ == "__main__":
                 average_loss += loss_val
                 batch_counter += 1
 
-            # next = session.run(iter_training_set.get_next())
-            # print(next)
-            # print(next['items_input'])
-            # #print(next['profile_input'])
-            # print(next['train_labels'])
+            # next_batch = session.run(iter_training_set.get_next())
+            # print(next_batch)
+            # print(next_batch['items_input'])
+            # #print(next_batch['profile_input'])
+            # print(next_batch['labels'])
 
             epoch_counter += 1
             batch_counter = 0
@@ -989,7 +1026,7 @@ if __name__ == "__main__":
             average_loss = 0.0
 
             sim = similarity.eval()
-            for i in range(valid_size):
+            for i in range(len(valid_examples)):
                 # if synthetic:
                 valid_item = valid_examples[i]
 
@@ -1012,7 +1049,7 @@ if __name__ == "__main__":
 
             if not synthetic:
                 print("----------------------------------------------\n")
-                for i in range(valid_size):
+                for i in range(len(valid_examples)):
                     # if synthetic:
                     valid_item = valid_examples[i]
 
