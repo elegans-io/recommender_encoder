@@ -1,16 +1,22 @@
 import xml.etree.ElementTree as ET
 import numpy as np
 import datetime
-import math
 import re
 import itertools
 from operator import itemgetter
-from keras.layers import Embedding, Dense, Flatten, Dropout, Reshape, Lambda
-from keras.models import Sequential, Model
+import recutils
+import keras as ks
+from keras.layers import Embedding, Dense, LSTM, Flatten, Dropout, Reshape
+from keras.models import Sequential
+from keras import losses
 from keras import optimizers
-from keras.callbacks import EarlyStopping
+from keras.callbacks import Callback, ModelCheckpoint
 from sklearn.model_selection import train_test_split
 import argparse
+import pickle
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 
 def parse_args():
@@ -31,6 +37,22 @@ def parse_args():
                         help='number of training baskets (default 3).')
     parser.add_argument('-t', '--n-train_items', type=int, required=False, dest='num_train_items', default=20,
                         help='number of labels to train with (default 20)')
+    parser.add_argument('-n', '--nodes', type=int, required=False, dest='nodes', default=16,
+                        help='model layers\' nodes (default 16).')
+    parser.add_argument('-p', '--dropout', type=float, required=False, dest='dropout', default=0.0,
+                        help='dropout probability (default 0.0)')
+    parser.add_argument('-s', '--do-serialization', required=False, dest='do_serialization', action='store_false',
+                        help='do serialization of data structures obtained from xml-data-file (default False)')
+    parser.add_argument('-u', '--dropout-rnn', type=float, required=False, dest='dropout_rnn', default=0.0,
+                        help='dropout probability for RNN layer both input and recurrent (default 0.0)')
+    parser.add_argument('-f', '--loss', type=str, required=False, dest='loss_funct', default='bxe',
+                        help='loss function (bxe=binary cross-entropy, fl=focal loss, wl=weighted loss) (default bxe)')
+    parser.add_argument('-a', '--alpha', type=float, required=False, dest='alpha', default='0.25',
+                        help='alpha parameter for focal loss (default 0.25)')
+    parser.add_argument('-g', '--gamma', type=float, required=False, dest='gamma', default='2.0',
+                        help='gamma parameter for focal loss (default 2.0)')
+    parser.add_argument('-q', '--model_type', type=str, required=False, dest='model_type', default='dense',
+                        help='model type (dense=fully connected, rnn=recurrent, (default=dense)')
     args = parser.parse_args()
 
     return args
@@ -191,37 +213,163 @@ def data_transform(baskets, num_train_baskets, num_train_items,
     return np.array(X), np.array(y)
 
 
+def model_params(args, vocabulary_size):
+
+    params = {
+        'model_type': args.model_type.lower(),
+        'batch_size': args.batch_size,
+        'vocabulary_size': vocabulary_size,
+        'embedding_dimension': args.embedding_dimension,
+        'learning_rate': args.learning_rate,
+        'num_epochs': args.num_epochs,
+        'nodes': args.nodes,
+        'dropout': args.dropout,
+        'dropout_rnn': args.dropout_rnn,
+        'num_train_baskets': args.num_train_baskets,
+        'num_train_items': args.num_train_items,
+        'min_num_baskets': args.min_num_baskets,
+        'loss_fct_str': args.loss_funct.lower(),
+        'alpha': args.alpha,
+        'gamma': args.gamma
+    }
+
+    return params
+
+
+class RecommenderModel:
+    '''
+    Wrapper of the Sequential Keras's model
+    '''
+    def __init__(self, params):
+        self.params = params
+        self.model = None
+        self.metrics = ['binary_accuracy', 'categorical_accuracy']
+
+    def build(self):
+        self.model = Sequential()
+        self.model.add(Embedding(input_dim=self.params['vocabulary_size'],
+                                 output_dim=self.params['embedding_dimension'],
+                                 input_length=self.params['num_train_items'] * self.params['num_train_baskets'],
+                                 mask_zero=False))
+
+        if self.params['model_type'] == 'dense':
+            self.model.add(Flatten())
+            self.model.add(Dense(units=self.params['embedding_dimension'] * self.params['num_train_items'] * self.params['num_train_baskets'], activation='relu'))
+            self.model.add(Dropout(self.params['dropout']))
+            self.model.add(Dense(units=self.params['nodes'], activation='relu'))
+            self.model.add(Dropout(self.params['dropout']))
+            self.model.add(Dense(units=self.params['vocabulary_size'], activation='sigmoid'))
+
+        elif self.params['model_type'] == 'rnn':
+            self.model.add(Reshape((self.params['num_train_baskets'], self.params['num_train_items'] * self.params['embedding_dimension'])))
+            self.model.add(LSTM(self.params['nodes'], dropout=self.params['dropout_rnn'], recurrent_dropout=self.params['dropout_rnn']))
+            self.model.add(Dropout(self.params['dropout']))
+            self.model.add(Dense(units=self.params['num_train_items'], activation='relu'))
+            self.model.add(Dropout(self.params['dropout']))
+            self.model.add(Dense(units=self.params['vocabulary_size'], activation='sigmoid'))
+        else:
+            raise NotImplementedError
+
+    def compile(self, loss_fct):
+        optimizer = optimizers.Adam(lr=self.params['learning_rate'])
+        self.model.compile(loss=loss_fct,
+                           optimizer=optimizer,
+                           metrics=self.metrics)
+
+        self.model.summary()
+
+    def fit(self, X, y, valid_split, callbacks):
+        hist = self.model.fit(X, y,
+                              validation_split=valid_split,
+                              batch_size=self.params['batch_size'],
+                              epochs=self.params['num_epochs'],
+                              callbacks=callbacks,
+                              verbose=1)
+        return hist
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+    def evaluate(self, X, y):
+        return self.model.evaluate(X, y)
+
+    def prefix_str(self):
+        if self.params['model_type'] == 'dense':
+            prefix = 'model_{t}_ed_{ed:02d}_ntb_{ntb:1d}_nti_{nti:02d}_mnb_{mnb:1d}_' \
+                              'e_{ep:03d}_b_{bs:03d}_r_{lr:.3f}_dp_{dp:.02f}_adam_{lf}'. \
+                format(t=self.params['model_type'], ed=self.params['embedding_dimension'],
+                       ntb=self.params['num_train_baskets'],
+                       nti=self.params['num_train_items'], mnb=self.params['min_num_baskets'],
+                       ep=self.params['num_epochs'], bs=self.params['batch_size'], lr=self.params['learning_rate'],
+                       dp=self.params['dropout'],
+                       lf=self.params['loss_fct_str'])
+        else:
+            prefix = 'model_{t}_ed_{ed:02d}_ntb_{ntb:1d}_nti_{nti:02d}_mnb_{mnb:1d}_' \
+                              'e_{ep:03d}_b_{bs:03d}_r_{lr:.3f}_n_{ns:02d}_dp_{dp:.02f}_dpr_{dpr:.02f}_adam_{lf}'. \
+                format(t=self.params['model_type'], ed=self.params['embedding_dimension'],
+                       ntb=self.params['num_train_baskets'],
+                       nti=self.params['num_train_items'], mnb=self.params['min_num_baskets'],
+                       ep=self.params['num_epochs'], bs=self.params['batch_size'], lr=self.params['learning_rate'],
+                       ns=self.params['nodes'], dp=self.params['dropout'], dpr=self.params['dropout_rnn'],
+                       lf=self.params['loss_fct_str'])
+
+        return prefix
+
+
 if __name__ == '__main__':
 
     args = parse_args()
-    batch_size = args.batch_size
     filename = args.xml_data_file
-    embedding_dimension = args.embedding_dimension
-    learning_rate = args.learning_rate
-    num_epochs = args.num_epochs
-    drop_prob = args.dropout_prob
-    num_train_baskets = args.num_train_baskets
-    num_train_items = args.num_train_items
-    min_num_baskets = args.min_num_baskets
+    loss_fct_str = args.loss_funct.lower()
+    alpha = args.alpha
+    gamma = args.gamma
 
-    baskets, items, item_rankid, rankid_item = load_data(filename)
+    baskets_filename = 'baskets'
+    items_filename = 'items'
+    item_rankid_filename = 'item_rankid'
+    rankid_item_filename = 'rankid_item'
+
+    do_serialize = False
+    if do_serialize:
+        baskets, items, item_rankid, rankid_item = load_data(filename)
+
+        with open(baskets_filename, 'wb') as f:
+            pickle.dump(baskets, f)
+
+        with open(items_filename, 'wb') as f:
+            pickle.dump(items, f)
+
+        with open(item_rankid_filename, 'wb') as f:
+            pickle.dump(item_rankid, f)
+
+        with open(rankid_item_filename, 'wb') as f:
+            pickle.dump(rankid_item, f)
+
+    else:
+        with open(baskets_filename, 'rb') as f:
+            baskets = pickle.load(f)
+
+        with open(items_filename, 'rb') as f:
+            items = pickle.load(f)
+
+        with open(item_rankid_filename, 'rb') as f:
+            item_rankid = pickle.load(f)
+
+        with open(rankid_item_filename, 'rb') as f:
+            rankid_item = pickle.load(f)
 
     print(len(items))
     vocabulary_size = len(items) + 1  # + 1 bc zero is for masking
 
-    X, y = data_transform(baskets=baskets,
-                          num_train_baskets=num_train_baskets,
-                          num_train_items=num_train_items,
-                          min_num_baskets=min_num_basketss, item_rankid=item_rankid,
-                          flatten=True, mask_zero=False,
-                          fixed_length=True)
+    params = model_params(args, vocabulary_size)
 
-    print("first 'X':\n")
-    print(X.shape, X[0])
-    print("\n\nfirst 'y':\n")
-    print(y.shape, len(y[0]))
-    print("X shape: ", X.shape)
-    print(X.shape == (len(X), num_train_items*num_train_baskets))
+    X, y = data_transform(baskets=baskets,
+                          num_train_baskets=params['num_train_baskets'],
+                          num_train_items=params['num_train_items'],
+                          min_num_baskets=params['min_num_baskets'], item_rankid=item_rankid,
+                          flatten=True,
+                          mask_zero=False,
+                          fixed_length=True)
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 
@@ -230,45 +378,56 @@ if __name__ == '__main__':
     y_test_multilabel = np.zeros([len(y_test), vocabulary_size])
     for i, y in enumerate(y_train):
         y_train_multilabel[i, y] = 1
-        
     for i, y in enumerate(y_test):
         y_test_multilabel[i, y] = 1
 
-    simple_model = Sequential()
-    simple_model.add(Embedding(input_dim=vocabulary_size,
-                               output_dim=embedding_dimension,
-                               input_length=num_train_items * num_train_baskets,
-                               mask_zero=False))
-    simple_model.add(Flatten())
-    simple_model.add(Dense(units=embedding_dimension, activation='relu'))
-    simple_model.add(Dense(units=vocabulary_size, activation='sigmoid'))
+    # determine the loss function
+    if loss_fct_str == 'bxe':
+        loss_fct = losses.binary_crossentropy
+    elif loss_fct_str == 'wl':
+        class_weights = recutils.compute_class_weights(y_train_multilabel)
+        loss_fct = recutils.weighted_loss(class_weights)
+    elif loss_fct_str == 'fl':
+        loss_fct = recutils.focal_loss(gamma, alpha)
+    else:
+        print('Unknow loss. setting to default loss (binary crossentropy)')
+        loss_fct = losses.binary_crossentropy
 
-    adam_opt = optimizers.Adam(lr=learning_rate)
-    simple_model.compile(loss='binary_crossentropy',
-                         optimizer=adam_opt,
-                         metrics=['accuracy'])
+    # instantiate the recommender model
+    recommend_model = RecommenderModel(params)
+    recommend_model.build()
+    recommend_model.compile(loss_fct)
 
-    simple_model.summary()
+    # callbacks
+    checkpoint = ModelCheckpoint('model.hdf5', monitor='val_multilabel_acc', save_best_only=True, mode='max', verbose=1)
+    metrics = recutils.Metrics()
+    callbacks = [metrics, checkpoint]
 
-    early_stop = EarlyStopping(monitor='val_loss', patience=5, verbose=0)
+    # fit the model
+    valid_split = 0.2
+    hist = recommend_model.fit(X_train, y_train_multilabel, valid_split, callbacks)
 
-    simple_model.fit(X_train, y_train_multilabel,
-                     validation_split=0.1,
-                     batch_size=batch_size,
-                     epochs=num_epochs,
-                     callbacks=[early_stop])
+    # training set predictions
+    predictions = recommend_model.predict(X_train)
+    accuracy = recutils.multilabel_acc(y_train, predictions)
+    print('train multilabel accuracy: {:.3f}'.format(accuracy))
 
-    predictions = simple_model.predict(X_test)
+    _, bin_acc, cat_acc = recommend_model.evaluate(X_test, y_test_multilabel)
+    print('test_bin_acc: {:.3f}, test_cat_acc: {:.3f}'.format(bin_acc, cat_acc))
 
-    yhat = []
-    for prediction, expectation in zip(predictions, y_test):
-        yhat.append(np.argpartition(prediction, -len(expectation))[-len(expectation):])
+    # test set predictions
+    predictions = recommend_model.predict(X_test)
+    accuracy = recutils.multilabel_acc(y_test, predictions)
+    print('test multilabel accuracy: {:.3f}'.format(accuracy))
 
-    matches = 0
-    total_count = 0
-    for prediction, expectation in zip(yhat, y_test):
-        matches += len(set(prediction).intersection(set(expectation)))
-        total_count += len(expectation)
-    accuracy = matches / float(total_count)
-    print('accuracy: {:.3f}'.format(accuracy))
+    # generate and save the plot of the validation multilabel accuracy on the validation set
+    plt.plot(hist.epoch, hist.history['val_multilabel_acc'], 'ro')
+    plt.xlabel('Epochs')
+    plt.ylabel('Multilabel Accuracy')
+    plt.grid(True)
+    hist_min = np.min(hist.history['val_multilabel_acc'])
+    hist_max = np.max(hist.history['val_multilabel_acc'])
+    plt.axis([0, params['num_epochs'], hist_min, hist_max])
+    plt.savefig('val_multilabel_acc.png')
+
 
